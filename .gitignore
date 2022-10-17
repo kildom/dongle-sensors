@@ -1,8 +1,5 @@
-/*.elf
-/*.hex
-/*.lst
-/*.map
 /cmsis/
 /CMSIS/
 /nrfx/
 /.vscode/
+/build/*/
