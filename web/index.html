@@ -1,0 +1,128 @@
+<html>
+
+<body>
+
+	<script>
+
+		function log(...x) {
+			console.log(...x);
+			let text = x.join(' ');
+			let e = document.getElementById('log');
+			e.value += text + '\n';
+		}
+
+		async function runTestInner() {
+
+			const MAX_REQUEST_SIZE = 512;
+			const MAX_RESPONSE_SIZE = 512;
+			const CHUNK_SIZE = 16;
+			const CHUNK_FLAG_BEGIN = 0x40;
+			const CHUNK_FLAG_END = 0x80;
+			const CHUNK_ID_MASK = 0x3F;
+
+			let char;
+			let cmd_id = Math.floor((Math.random() * 10000000)) & CHUNK_ID_MASK;
+			let ind_value = 0;
+
+			function blink() {
+				let e = document.getElementById('output');
+				ind_value ^= 1;
+				e.style.backgroundColor = ind_value ? 'red' : 'silver';
+				setTimeout(() => {
+					ind_value ^= 1;
+					e.style.backgroundColor = ind_value ? 'red' : 'silver';
+				}, 100);
+			}
+
+			async function cmd(data) {
+				cmd_id = (cmd_id + 1) & CHUNK_ID_MASK;
+				let offset = 0;
+				if (data.length == 0 || data.length > MAX_REQUEST_SIZE) {
+					throw Error('Invalid command length');
+				}
+				while (offset < data.length) {
+					let writeBytes = data.length - offset;
+					if (writeBytes > CHUNK_SIZE) {
+						writeBytes = CHUNK_SIZE;
+					}
+					let temp = new Uint8Array(1 + writeBytes);
+					temp[0] = cmd_id;
+					if (offset == 0) {
+						temp[0] |= CHUNK_FLAG_BEGIN;
+					}
+					if (offset + writeBytes == data.length) {
+						temp[0] |= CHUNK_FLAG_END;
+					}
+					temp.set(data.subarray(offset, offset + writeBytes), 1);
+					blink();
+					await char.writeValueWithResponse(temp);
+					offset += writeBytes;
+				}
+
+				let result = new Uint8Array(0);
+				do {
+					blink();
+					buf = await char.readValue();
+					buf = new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
+					if (buf.length < 1) {
+						await new Promise(resolve => setTimeout(resolve, 200));
+						continue;
+					} else if ((buf[0] & CHUNK_ID_MASK) != cmd_id) {
+						throw Error('Invalid response - unexpected id');
+					} else if (result.length == 0 && !(buf[0] & CHUNK_FLAG_BEGIN)) {
+						throw Error('Invalid response - expecting response begin');
+					}
+					let t = new Uint8Array(result.length + buf.length - 1);
+					t.set(result);
+					t.set(buf.subarray(1), result.length);
+					result = t;
+				} while (!(buf[0] & CHUNK_FLAG_END));
+
+				log(result.length);
+
+				return result;
+			}
+
+			const serviceUuid = "cc2af14a-2aaf-4c6e-b2e4-3856ee2b4267";
+			const charUuid = "45cc8e0b-8507-45f7-ac95-b798d0fd732a";
+
+			log('Requesting Bluetooth Device...');
+			const device = await navigator.bluetooth.requestDevice({
+				filters: [{ services: [serviceUuid] }],
+				optionalServices: [serviceUuid]
+			});
+
+			log(device);
+			log(await device.gatt.connect());
+			log(device.gatt);
+			let service = await device.gatt.getPrimaryService(serviceUuid);
+			log(service);
+			char = await service.getCharacteristic(charUuid);
+			let val = new Uint8Array(256);
+			val.fill(0x43);
+			await new Promise(resolve => setTimeout(resolve, 3000));
+			log(await cmd(val));
+			log(await device.gatt.disconnect());
+
+			device.forget();
+
+		}
+
+		async function runTest() {
+			try {
+				await runTestInner();
+			} catch (ex) {
+				log(ex.toString());
+			}
+		}
+
+
+	</script>
+
+	<button onclick="runTest(); return false;" id="output">Run Test</button><br/>
+
+	<textarea style="width: 95%; height: 700px;" id="log"></textarea>
+
+</body>
+
+</html>
