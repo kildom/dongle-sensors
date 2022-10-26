@@ -11,10 +11,6 @@ const DAYS_BEFORE_1970 = 719528;
 const FIRST_DAY_OF_WEAK_OF_YEAR_0 = 6;
 
 
-function calc_year(time) {
-	return [year, leap, day_of_year, time_of_day];
-}
-
 function days_before_month(month, leap_year) {
 	days = Math.floor((month * 214 + 3) / 7);
 	if (month >= 2) {
@@ -23,10 +19,17 @@ function days_before_month(month, leap_year) {
 	return days;
 }
 
-function convert_time_utc(time) {
-	let day_from_1970 = Math.floor(time / SECONDS_PER_DAY);
-	let time_of_day = time - SECONDS_PER_DAY * day_from_1970;
-	let day_from_0 = DAYS_BEFORE_1970 + day_from_1970;
+function days_of_month(month, leap_year) {
+	month++;
+	let days = 30 + ((month ^ (month >> 3)) & 1);
+	if (month == 2) {
+		days -= leap_year ? 1 : 2;
+	}
+	return days;
+}
+
+
+function date_from_days_from_0(day_from_0) {
 	let day_of_week = (FIRST_DAY_OF_WEAK_OF_YEAR_0 + day_from_0) % 7;
 	let c400 = Math.floor(day_from_0 / DAYS_PER_400_YEARS);
 	let day_of_year = day_from_0 % DAYS_PER_400_YEARS;
@@ -67,6 +70,14 @@ function convert_time_utc(time) {
 	}
 	month++;
 	day++;
+	return [year, month, day, day_of_week, leap];
+}
+
+function convert_time_utc(time) {
+	let day_from_1970 = Math.floor(time / SECONDS_PER_DAY);
+	let time_of_day = time - SECONDS_PER_DAY * day_from_1970;
+	let day_from_0 = DAYS_BEFORE_1970 + day_from_1970;
+	let [year, month, day, day_of_week, leap] = date_from_days_from_0(day_from_0);
 	let hour = time_of_day;
 	let sec = hour % 60;
 	hour = Math.floor(hour / 60);
@@ -111,49 +122,6 @@ function make_time_utc(year, month, day, hour, min, sec)
 	return (days_from_0 - DAYS_BEFORE_1970) * SECONDS_PER_DAY + time_of_day;
 }
 
-function make_time_tz(year, month, day, hour, min, sec, tz)
-{
-	let [days_from_0, time_of_day] = normalize_date(year, month, day, hour, min, sec);
-	[year, month, day, day_of_week, leap_year] = date_from_days_from_0(days_from_0); // TODO: extracted from convert_time_utc
-
-	let daylight_enabled;
-
-	// TODO: maybe most of it can be shared with convert_time_tz()
-	if (tz.daylight.delta == 0 || month < tz.daylight.start_month || month > tz.daylight.end_month) {
-		daylight_enabled = false;
-	} else if (month > tz.daylight.start_month && month < tz.daylight.end_month) {
-		daylight_enabled = true;
-	} else if (month == tz.daylight.start_month) {
-		let tr_day = calc_transition_day(tz.daylight.start_month, tz.daylight.start_day, tz.daylight.start_week, day, day_of_week, leap_year);
-		if (day < tr_day) {
-			daylight_enabled = false;
-		} else if (day > tr_day) {
-			daylight_enabled = true;
-		} else if (time_of_day < tz.daylight.start_time + tz.daylight.delta) {
-			daylight_enabled = false;
-		} else {
-			daylight_enabled = true;
-		}
-	} else {
-		let tr_day = calc_transition_day(tz.daylight.end_month, tz.daylight.end_day, tz.daylight.end_week, day, day_of_week, leap_year);
-		if (day < tr_day) {
-			daylight_enabled = true;
-		} else if (day > tr_day) {
-			daylight_enabled = false;
-		} else if (time_of_day < tz.daylight.end_time + tz.daylight.delta) {
-			daylight_enabled = true;
-		} else {
-			daylight_enabled = false;
-		}
-	}
-
-	let result = (days_from_0 - DAYS_BEFORE_1970) * SECONDS_PER_DAY + time_of_day - tz.utc_offset;
-	if (daylight_enabled) {
-		result -= tz.daylight.delta;
-	}
-	return result;
-}
-
 time_zone = {
 	utc_offset: 1 * 60 * 60,
 	daylight: {
@@ -176,7 +144,7 @@ function calc_transition_day(tr_month, tr_day, tr_week, day, day_of_week, leap_y
 	}
 	tr_month--;
 	day--;
-	let days_per_month = days_before_month(tr_month + 1, leap_year) - days_before_month(tr_month, leap_year);
+	let days_per_month = days_of_month(tr_month, leap_year);
 	if (tr_week >= 0) {
 		let first_day_of_month = (day_of_week - day + 35) % 7;
 		let first_tr_day_of_month = tr_day - first_day_of_month;
@@ -203,44 +171,57 @@ function calc_transition_day(tr_month, tr_day, tr_week, day, day_of_week, leap_y
 }
 
 
-function convert_time_tz(time, tz) {
-	let tz_time = time + tz.utc_offset;
-	let [year, month, day, hour, min, sec, day_of_week, leap_year] = convert_time_utc(tz_time);
-	let day_time = sec + 60 * (min + 60 * hour);
-	let daylight_enabled;
+function is_daylight_enabled(month, day, time_of_day, day_of_week, leap_year, tz, delta)
+{
 	if (tz.daylight.delta == 0 || month < tz.daylight.start_month || month > tz.daylight.end_month) {
-		daylight_enabled = false;
+		return false;
 	} else if (month > tz.daylight.start_month && month < tz.daylight.end_month) {
-		daylight_enabled = true;
+		return true;
 	} else if (month == tz.daylight.start_month) {
 		let tr_day = calc_transition_day(tz.daylight.start_month, tz.daylight.start_day, tz.daylight.start_week, day, day_of_week, leap_year);
 		if (day < tr_day) {
-			daylight_enabled = false;
+			return false;
 		} else if (day > tr_day) {
-			daylight_enabled = true;
-		} else if (day_time < tz.daylight.start_time) {
-			daylight_enabled = false;
+			return true;
+		} else if (time_of_day < tz.daylight.start_time + delta) {
+			return false;
 		} else {
-			daylight_enabled = true;
+			return true;
 		}
 	} else {
 		let tr_day = calc_transition_day(tz.daylight.end_month, tz.daylight.end_day, tz.daylight.end_week, day, day_of_week, leap_year);
 		if (day < tr_day) {
-			daylight_enabled = true;
+			return true;
 		} else if (day > tr_day) {
-			daylight_enabled = false;
-		} else if (day_time < tz.daylight.end_time) {
-			daylight_enabled = true;
+			return false;
+		} else if (time_of_day < tz.daylight.end_time + delta) {
+			return true;
 		} else {
-			daylight_enabled = false;
+			return false;
 		}
 	}
+}
 
-	if (daylight_enabled) {
+function convert_time_tz(time, tz) {
+	let tz_time = time + tz.utc_offset;
+	let [year, month, day, hour, min, sec, day_of_week, leap_year] = convert_time_utc(tz_time);
+	let time_of_day = sec + 60 * (min + 60 * hour);
+	if (is_daylight_enabled(month, day, time_of_day, day_of_week, leap_year, tz, 0)) {
 		return convert_time_utc(tz_time + tz.daylight.delta);
 	} else {
 		return [year, month, day, hour, min, sec, day_of_week, leap_year];
 	}
+}
+
+function make_time_tz(year, month, day, hour, min, sec, tz)
+{
+	let [days_from_0, time_of_day] = normalize_date(year, month, day, hour, min, sec);
+	[year, month, day, day_of_week, leap_year] = date_from_days_from_0(days_from_0);
+	let result = (days_from_0 - DAYS_BEFORE_1970) * SECONDS_PER_DAY + time_of_day - tz.utc_offset;
+	if (is_daylight_enabled(month, day, time_of_day, day_of_week, leap_year, tz, tz.daylight.delta)) {
+		result -= tz.daylight.delta;
+	}
+	return result;
 }
 
 
@@ -281,6 +262,31 @@ for (let y = 1000; y < 4000; y++) {
 			date.setUTCHours(hour, min, sec);
 			time = Math.floor(date.getTime() / 1000);
 			t = make_time_utc(yy, mm + 1, dd, hour, min, sec);
+			if (t != time) throw `Different time output ${t} != ${time}   --   ${date.toISOString()}`;
+		}
+	}
+}
+
+for (let y = 1996; y < 4000; y++) {
+	console.log(y);
+	for (let m = 0; m < 12; m++) {
+		for (let d = 1; d <= 31; d++) {
+			let hour = Math.floor(Math.random() * 4);
+			let min = Math.floor(Math.random() * 600);
+			let sec = Math.floor(Math.random() * 600);
+			let date = new Date(0);
+			date.setFullYear(y, m, d);
+			date.setHours(hour, min, sec);
+			let time = Math.floor(date.getTime() / 1000);
+			let x = convert_time_tz(time, time_zone);
+			if (x[0] != date.getFullYear()) throw `Different Year ${x[0]} != ${date.getFullYear()}   --   ${date.toISOString()}`;
+			if (x[1] != date.getMonth() + 1) throw `Different Month ${x[1]} != ${date.getMonth() + 1}   --   ${date.toISOString()}`;
+			if (x[2] != date.getDate()) throw `Different Date ${x[2]} != ${date.getDate()}   --   ${date.toISOString()}`;
+			if (x[3] != date.getHours()) throw `Different Hours ${x[3]} != ${date.getHours()}   --   ${date.toISOString()}`;
+			if (x[4] != date.getMinutes()) throw `Different Minutes ${x[4]} != ${date.getMinutes()}   --   ${date.toISOString()}`;
+			if (x[5] != date.getSeconds()) throw `Different Seconds ${x[5]} != ${date.getSeconds()}   --   ${date.toISOString()}`;
+			if (x[6] != date.getDay()) throw `Different Day Of Week ${x[6]} != ${date.getDay()}   --   ${date.toISOString()}`;
+			let t = make_time_tz(y, m + 1, d, hour, min, sec, time_zone);
 			if (t != time) throw `Different time output ${t} != ${time}   --   ${date.toISOString()}`;
 		}
 	}
