@@ -1,10 +1,5 @@
-/*
- * Copyright (c) 2016 Intel Corporation
- *
- * SPDX-License-Identifier: Apache-2.0
- */
 
-#include <zephyr/zephyr.h>
+#include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/drivers/gpio.h>
 #include <zephyr/bluetooth/bluetooth.h>
@@ -17,448 +12,233 @@
 #include <mpsl.h>
 #include <hal/nrf_timer.h>
 
+#include "calendar.h"
 #include "multiproto.h"
 #include "leds.h"
+#include "radio.h"
+#include "ble.h"
+#include "data.h"
 
 #define LOG_LEVEL CONFIG_DEFAULT_LOG_LEVEL
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(temp_main);
 
-#define BT_UUID_CUSTOM_SERVICE_VAL \
-	BT_UUID_128_ENCODE(0xCC2AF14A, 0x2AAF, 0x4C6E, 0xB2E4, 0x3856EE2B4267)
+#define CMD_GET_UP_TIME 1
+#define CMD_READ 2
+#define CMD_WRITE 3
+#define CMD_KEEP 4
 
-static struct bt_uuid_128 vnd_uuid = BT_UUID_INIT_128(
-	BT_UUID_CUSTOM_SERVICE_VAL);
-
-static struct bt_uuid_128 vnd_ept_uuid = BT_UUID_INIT_128(
-	BT_UUID_128_ENCODE(0x45CC8E0B, 0x8507, 0x45F7, 0xAC95, 0xB798D0FD732A));
+#define STATUS_OK 0
+#define STATUS_UNKNOWN_CMD 1
+#define STATUS_OUT_OF_BOUNDS 2
 
 
-static const struct bt_data ad[] = {
-	BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
-	BT_DATA_BYTES(BT_DATA_UUID128_ALL, BT_UUID_CUSTOM_SERVICE_VAL),
+Config config;
+State state;
+
+
+static struct k_work on_packet_work;
+
+
+void ble_packet() {
+	k_work_submit(&on_packet_work);
+}
+
+#define PACKET_HEADER_SIZE 4
+
+typedef struct {
+	uint8_t cmd;
+	uint8_t tag;
+	uint16_t id;
+	union
+	{
+		struct {
+			uint16_t offset;
+			uint16_t size;
+		} read;
+		struct {
+			uint16_t offset;
+			uint8_t buffer[0];
+		} write;
+	};
+} Request;
+
+typedef struct {
+	uint8_t cmd;
+	uint8_t status;
+	uint16_t id;
+	union
+	{
+		struct {
+			uint32_t time;
+		} get_up_time;
+		struct {
+			uint8_t buffer[0];
+		} read;
+	};
+} Response;
+
+
+static void on_packet_work_handler(struct k_work *work)
+{
+	const Request* req = (const Request*)&ble_request[0];
+	Response* res = (Response*)&ble_response[0];
+	void* response_end = &ble_response[PACKET_HEADER_SIZE];
+	res->cmd = req->cmd;
+	res->status = STATUS_OK;
+	res->id = req->id;
+	switch (req->cmd)
+	{
+	case CMD_GET_UP_TIME:
+		res->get_up_time.time = k_uptime_get() / (int64_t)1000;
+		response_end = &res->get_up_time.time + 1;
+		break;
+	case CMD_READ: {
+		printk("READ %d from %d\n", req->read.size, req->read.offset);
+		uint8_t* src = req->tag == 0 ? (uint8_t*)&config : (uint8_t*)&state;
+		size_t src_size = req->tag == 0 ? sizeof(config) : sizeof(state);
+		if ((size_t)req->read.size > sizeof(ble_response) - PACKET_HEADER_SIZE
+			|| (size_t)req->read.offset + (size_t)req->read.size > src_size
+			|| req->tag > 1) {
+			res->status = STATUS_OUT_OF_BOUNDS;
+			break;
+		}
+		memcpy(res->read.buffer, src + (size_t)req->read.offset, req->read.size);
+		response_end = &res->read.buffer[req->read.size];
+		break;
+	}
+	case CMD_WRITE: {
+		uint8_t* dst = req->tag == 0 ? (uint8_t*)&config : (uint8_t*)&state;
+		size_t dst_size = req->tag == 0 ? sizeof(config) : sizeof(state);
+		size_t write_size = ble_request_size - offsetof(Request, write.buffer);
+		printk("WRITE %d to %d\n", write_size, req->write.offset);
+		if (write_size + (size_t)req->write.offset > sizeof(dst_size) || req->tag > 1) {
+			res->status = STATUS_OUT_OF_BOUNDS;
+			break;
+		}
+		memcpy(dst + (size_t)req->write.offset, req->write.buffer, write_size);
+		break;
+	}
+	case CMD_KEEP:
+		printk("TODO: save config!\n");
+		break;
+	default:
+		res->status = STATUS_UNKNOWN_CMD;
+		break;
+	}
+
+	ble_response_size = (uint8_t*)response_end - &ble_response[0]; // TODO: atomic response_size
+	printk("Response size %d\n", ble_response_size);
+}
+
+static int t = 0;
+static int v = 0;
+static volatile bool is_new = false;
+
+void packet_received(OutputPacket* packet)
+{
+	t = packet->temp;
+	v = packet->voltage;
+	is_new = true;
+}
+
+static const char* day_names[7] = {
+	"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
 };
-
-#define CHUNK_SIZE 16
-#define CHUNK_FLAG_BEGIN 0x40
-#define CHUNK_FLAG_END 0x80
-#define CHUNK_ID_MASK 0x3F
-
-static uint8_t request[512];
-static uint8_t request_id = 255;
-static int request_offset = 0;
-static int request_size = 0;
-
-static uint8_t response[512];
-static uint8_t response_id = 255;
-static int response_offset = 0;
-static int response_size = 0;
-
-
-static void on_packet() {
-	memcpy(response, request, request_size);
-	response_size = request_size;
-	printk("Packet %d bytes\n", request_size);
-}
-
-
-static ssize_t read_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-			void *buf, uint16_t len, uint16_t offset)
-{
-	uint8_t temp[1 + CHUNK_SIZE];
-	printk("GATT read %d bytes at %d\n", len, offset);
-
-	if (offset != 0 || len <= 1 + CHUNK_SIZE) {
-		printk("GATT read INVALID\n");
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-	}
-
-	if (response_size == 0) {
-		return bt_gatt_attr_read(conn, attr, buf, len, offset, temp, 0);
-	} else if (response_offset >= response_size) {
-		temp[0] = CHUNK_FLAG_END;
-		return bt_gatt_attr_read(conn, attr, buf, len, offset, temp, 1);
-	}
-
-	int send_size = response_size - response_offset;
-	if (send_size > CHUNK_SIZE) {
-		send_size = CHUNK_SIZE;
-	}
-	temp[0] = response_id;
-	if (response_offset == 0) {
-		temp[0] |= CHUNK_FLAG_BEGIN;
-	}
-	memcpy(&temp[1], &response[response_offset], send_size);
-	response_offset += send_size;
-	if (response_offset == response_size) {
-		temp[0] |= CHUNK_FLAG_END;
-	}
-
-	return bt_gatt_attr_read(conn, attr, buf, len, offset, temp, 1 + send_size);
-}
-
-
-static ssize_t write_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
-			 const void *buf, uint16_t len, uint16_t offset,
-			 uint8_t flags)
-{
-	printk("GATT write %d bytes at %d\n", len, offset);
-
-	int err = 0;
-	uint8_t* input = (uint8_t*)buf + 1;
-	int input_len = len - 1;
-	uint8_t input_flags = input[-1];
-
-	if (offset != 0) {
-		err = BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
-		goto error;
-	} else if (input_len > CHUNK_SIZE || input_len < 0) {
-		err = BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
-		goto error;
-	} else if (input_flags & CHUNK_FLAG_BEGIN) {
-		request_id = input_flags & CHUNK_ID_MASK;
-		request_offset = 0;
-		request_size = 0;
-	} else if ((input_flags & CHUNK_ID_MASK) != request_id) {
-		err = BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
-		goto error;
-	}
-
-	if (request_offset + input_len > sizeof(request)) {
-		err = BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
-		goto error;
-	}
-
-	memcpy(&request[request_offset], input, input_len);
-	request_offset += input_len;
-	request_size = request_offset;
-
-	if (input_flags & CHUNK_FLAG_END) {
-		response_id = request_id;
-		response_size = 0;
-		response_offset = 0;
-		request_id = 255;
-		request_offset = 0;
-		on_packet();
-	}
-
-	return len;
-
-error:
-	request_id = 255;
-	request_offset = 0;
-	request_size = 0;
-	return err;
-}
-
-
-BT_GATT_SERVICE_DEFINE(vnd_svc,
-	BT_GATT_PRIMARY_SERVICE(&vnd_uuid),
-	BT_GATT_CHARACTERISTIC(&vnd_ept_uuid.uuid,
-			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
-			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
-			       read_vnd, write_vnd, NULL),
-);
-
 
 void main(void)
 {
-	int ret;
+	static DateTime dt;
 
 	printk("START\n");
 
 	leds_init();
 
-	ret = bt_enable(NULL);
-	if (ret) {
-		printk("Bluetooth init failed (err %d)\n", ret);
-		k_oops();
-	}
+	k_work_init(&on_packet_work, on_packet_work_handler);
 
-	ret = bt_le_adv_start(BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
-		BT_GAP_ADV_SLOW_INT_MIN, BT_GAP_ADV_SLOW_INT_MAX, NULL), ad, ARRAY_SIZE(ad), NULL, 0);
-	if (ret) {
-		printk("Advertising failed to start (err %d)\n", ret);
-		return;
-	}
+	ble_init();
 
 	multiproto_init();
 
 	while (1) {
-		k_msleep(3000);
-		printk("Tick\n");
-	}
-}
-
-__attribute__((aligned(4)))
-static uint8_t packet[256];
-
-typedef struct {
-	uint32_t address_low;
-	uint16_t address_high;
-	int16_t temp;
-	int16_t voltage;
-}__attribute__((aligned(4)))  OutputPacket;
-
-typedef struct {
-	uint32_t address_low;
-	uint16_t address_high;
-	uint16_t _reserved;
-	uint16_t flags;
-}__attribute__((aligned(4))) InputPacket;
-
-static OutputPacket *const output_packet = (OutputPacket*)&packet[0];
-static InputPacket *const input_packet = (InputPacket*)&packet[0];
-
-static const uint32_t FREQUENCY = 2400;
-static const uint32_t BASE_ADDR = 0x63e0;
-static const uint32_t PREFIX_BYTE_ADDR = 0x17;
-static const uint32_t CRC_POLY = 0x864CFB; // CRC-24-Radix-64 (OpenPGP)
-static const uint16_t INPUT_FLAG_ACK = 0x8000;
-
-K_MSGQ_DEFINE(my_msgq, sizeof(OutputPacket), 10, 4);
-
-bool multiproto_radio_callback2()
-{
-	if (NRF_RADIO->EVENTS_DISABLED) {
-		NRF_RADIO->EVENTS_DISABLED = 0;
-		NRF_RADIO->INTENCLR = 0xFFFFFFFF;
-		NRF_RADIO->POWER = 0;
-		return false;
-	} else if (NRF_RADIO->EVENTS_END) {
-		NRF_RADIO->EVENTS_END = 0;
-		led_toggle(1);
-		if ((NRF_RADIO->CRCSTATUS & RADIO_CRCSTATUS_CRCSTATUS_Msk) != RADIO_CRCSTATUS_CRCSTATUS_CRCOk ||
-			(NRF_RADIO->RXMATCH & RADIO_RXMATCH_RXMATCH_Msk) != 0)
-		{
-			NRF_RADIO->TASKS_START = 1;
-			return true;
+		k_msleep(1000);
+		if (state.time_shift == 0) {
+			int sec = (int)(k_uptime_get() / 1000LL);
+			int min = sec / 60; sec %= 60;
+			int hour = min / 60; min %= 60;
+			int day = hour / 24; hour %= 24;
+			printk("%d %02d:%02d:%02d %d\n", day, hour, min, sec, state.time_shift);
+		} else {
+			uint64_t time = k_uptime_get() / 1000LL + (uint64_t)state.time_shift;
+			convert_time_tz(time, &dt, &config.time_zone);
+			printk("%d-%02d-%02d %s %02d:%02d:%02d\n", dt.year, dt.month, dt.day, day_names[dt.day_of_week],
+				dt.hour, dt.min, dt.sec);
 		}
-		led_toggle(0);
+		if (is_new) {
+			is_new = false;
+			printk("Temperature: %d.%d%d*C\n", t / 100, (t / 10) % 10, t % 10);
+			printk("Voltage: %d.%d%dV\n", v / 100, (v / 10) % 10, v % 10);
+		}
 	}
-	return true;
 }
 
-void multiproto_start_callback2()
+
+#ifdef TEMP23409304
+
+void main_control()
 {
-	NRF_RADIO->POWER = 1;
-	NRF_RADIO->INTENCLR = 0xFFFFFFFF;
-	NVIC_EnableIRQ(RADIO_IRQn);
-	NVIC_SetPriority(RADIO_IRQn, 0);
-	NRF_RADIO->PACKETPTR = (uint32_t)&packet[0];
-	NRF_RADIO->FREQUENCY = FREQUENCY - 2400;
-	NRF_RADIO->MODE = 2;
-	NRF_RADIO->PCNF0 =
-		(0 << RADIO_PCNF0_LFLEN_Pos) |
-		(0 << RADIO_PCNF0_S0LEN_Pos) |
-		(0 << RADIO_PCNF0_S1LEN_Pos);
-	NRF_RADIO->PCNF1 =
-		(10 << RADIO_PCNF1_MAXLEN_Pos) |
-		(10 << RADIO_PCNF1_STATLEN_Pos) |
-		(2 << RADIO_PCNF1_BALEN_Pos) |
-		(RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
-	NRF_RADIO->BASE0 = BASE_ADDR;
-	NRF_RADIO->PREFIX0 = PREFIX_BYTE_ADDR << RADIO_PREFIX0_AP0_Pos;
-	NRF_RADIO->TXADDRESS = 0;
-	NRF_RADIO->RXADDRESSES = RADIO_RXADDRESSES_ADDR0_Msk;
-	NRF_RADIO->CRCCNF = RADIO_CRCCNF_LEN_Three << RADIO_CRCCNF_LEN_Pos;
-	NRF_RADIO->CRCPOLY = CRC_POLY;
-	NRF_RADIO->CRCINIT = 0;
+	AWAIT_BEGIN();
 
-	NRF_RADIO->EVENTS_END = 0;
-	NRF_RADIO->INTENSET = RADIO_INTENSET_END_Msk;
-	NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk;
-	NRF_RADIO->TASKS_RXEN = 1;
-}
-
-bool multiproto_end_callback2()
-{
-	NRF_RADIO->SHORTS = 0;
-	NRF_RADIO->INTENCLR = 0xFFFFFFFF;
-	NRF_RADIO->INTENSET = RADIO_INTENSET_DISABLED_Msk;
-	NRF_RADIO->TASKS_DISABLE = 1;
-	return true;
-}
-
-typedef enum {
-	_RECV_EV_RESERVED,
-	RECV_EV_RADIO,
-	RECV_EV_START,
-	RECV_EV_END,
-} RecvEventType;
-
-#define _AWAIT2(l, c) \
-	_resume_point = &&_resume_label_##l##_##c; \
-	ev = _RECV_EV_RESERVED; \
-	_resume_label_##l##_##c: \
-	do { } while (0)
-#define _AWAIT1(l, c) _AWAIT2(l, c)
-#define AWAIT _AWAIT1(__LINE__, __COUNTER__)
-
-#define ASYNC_BEGIN \
-	static void* _resume_point = &&_resume_label_start; \
-	goto *_resume_point; \
-	_resume_label_start: \
-	do { } while (0)
-
-
-bool receive_async_func(RecvEventType ev) {
-
-	LOG_WRN("receive_async_func %d %d", ev, NRF_RADIO->STATE);
-
-	if (ev == RECV_EV_START) {
-		goto start_from_beginning;
+	if (t < t_min) {
+		heat_on();
+		goto on_state;
+	} else {
+		heat_off();
 	}
-	ASYNC_BEGIN;
-	start_from_beginning:
 
-	// Init minimal
-	NRF_RADIO->POWER = 1;
-	NRF_RADIO->INTENCLR = 0xFFFFFFFF;
-	NVIC_EnableIRQ(RADIO_IRQn);
-	NVIC_SetPriority(RADIO_IRQn, 0);
+	while (true) {
 
-	// If other protocol left radio enabled, disable it
-	if (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled) {
-		NRF_RADIO->EVENTS_DISABLED = 0;
-		NRF_RADIO->INTENSET = RADIO_INTENSET_DISABLED_Msk;
-		NRF_RADIO->SHORTS = 0;
-		NRF_RADIO->TASKS_DISABLE = 1;
-		if (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled) {
+		do {
 			AWAIT;
-			if (ev == RECV_EV_END) goto end_during_disabling;
-			if (!NRF_RADIO->EVENTS_DISABLED) return true;
-			NRF_RADIO->EVENTS_DISABLED = 0;
-		}
-	}
-
-	// Continue radio initialization
-	NRF_RADIO->PACKETPTR = (uint32_t)&packet[0];
-	NRF_RADIO->FREQUENCY = FREQUENCY - 2400;
-	NRF_RADIO->MODE = 2;
-	NRF_RADIO->PCNF0 =
-		(0 << RADIO_PCNF0_LFLEN_Pos) |
-		(0 << RADIO_PCNF0_S0LEN_Pos) |
-		(0 << RADIO_PCNF0_S1LEN_Pos);
-	NRF_RADIO->PCNF1 =
-		(10 << RADIO_PCNF1_MAXLEN_Pos) |
-		(10 << RADIO_PCNF1_STATLEN_Pos) |
-		(2 << RADIO_PCNF1_BALEN_Pos) |
-		(RADIO_PCNF1_ENDIAN_Little << RADIO_PCNF1_ENDIAN_Pos);
-	NRF_RADIO->BASE0 = BASE_ADDR;
-	NRF_RADIO->PREFIX0 = PREFIX_BYTE_ADDR << RADIO_PREFIX0_AP0_Pos;
-	NRF_RADIO->TXADDRESS = 0;
-	NRF_RADIO->RXADDRESSES = RADIO_RXADDRESSES_ADDR0_Msk;
-	NRF_RADIO->CRCCNF = RADIO_CRCCNF_LEN_Three << RADIO_CRCCNF_LEN_Pos;
-	NRF_RADIO->CRCPOLY = CRC_POLY;
-	NRF_RADIO->CRCINIT = 0;
-	NRF_RADIO->TXPOWER = RADIO_TXPOWER_TXPOWER_Pos4dBm;
-
-	// Loop over single cycle: RX and TX pair
-	while (1) {
-		// Enable RX and (with short) start receiving packets
-		NRF_RADIO->EVENTS_END = 0;
-		NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk;
-		NRF_RADIO->INTENCLR = 0xFFFFFFFF;
-		NRF_RADIO->INTENSET = RADIO_INTENSET_END_Msk;
-		NRF_RADIO->TASKS_RXEN = 1;
-		// Loop over packets receiving until we get valid packet
-		while (1) {
-			// Wait for RX packet end (or timeslot "END" event)
+			if (t >= t_min) return;
+			set_timeout(17);
 			AWAIT;
-			LOG_WRN("resumed %d %d", ev, NRF_RADIO->STATE);
-			if (ev == RECV_EV_END) goto end_at_rx;
-			if (!NRF_RADIO->EVENTS_END) return true;
-			NRF_RADIO->EVENTS_END = 0;
-			led_toggle(0);
-			// Check if packet is valid
-			if ((NRF_RADIO->CRCSTATUS & RADIO_CRCSTATUS_CRCSTATUS_Msk) != (RADIO_CRCSTATUS_CRCSTATUS_CRCOk << RADIO_CRCSTATUS_CRCSTATUS_Pos) ||
-				(NRF_RADIO->RXMATCH & RADIO_RXMATCH_RXMATCH_Msk) != 0)
-			{
-				// Resume receiving if invalid
-				NRF_RADIO->TASKS_START = 1;
-				continue;
-			} else {
-				// Break this loop to process valid packet further
-				break;
-			}
-		}
-		led_toggle(1);
-		// Disable RX
-		NRF_RADIO->SHORTS = 0;
-		NRF_RADIO->INTENCLR = RADIO_INTENSET_END_Msk;
-		NRF_RADIO->INTENSET = RADIO_INTENSET_DISABLED_Msk;
-		NRF_RADIO->TASKS_DISABLE = 1;
-		// Wait until RX disabled (or timeslot "END" event)
+			if (timeout) break;
+			if (t < t_min) return;
+		} while (true);
+
+		heat_on();
+
+		set_timeout(30);
 		AWAIT;
-		if (ev == RECV_EV_END) goto end_during_disabling;
-		if (!NRF_RADIO->EVENTS_DISABLED) return true;
-		NRF_RADIO->EVENTS_DISABLED = 0;
-		// Process packet
-		LOG_ERR("Packet from %04X%08X", output_packet->address_high, output_packet->address_low);
-		int t = output_packet->temp;
-		LOG_ERR("Temperature: %d.%d%d*C", t / 100, (t / 10) % 10, t % 10);
-		int v = output_packet->voltage;
-		LOG_ERR("Voltage: %d.%d%dV", v / 100, (v / 10) % 10, v % 10);
-		input_packet->_reserved = 0;
-		input_packet->flags = INPUT_FLAG_ACK;
-		__DMB();
-		// Enable TX and (with short) send packet and (with short) disable TX
-		NRF_RADIO->SHORTS = RADIO_SHORTS_READY_START_Msk | RADIO_SHORTS_END_DISABLE_Msk;
-		NRF_RADIO->INTENSET = RADIO_INTENSET_DISABLED_Msk;
-		NRF_RADIO->TASKS_TXEN = 1;
-		// Wait until TX disabled (or timeslot "END" event)
+		if (!timeout) return;
+
+		wather_on();
+
+		set_timeout(2);
 		AWAIT;
-		if (ev == RECV_EV_END) goto end_at_tx;
-		if (!NRF_RADIO->EVENTS_DISABLED) return true;
-		NRF_RADIO->EVENTS_DISABLED = 0;
+		if (!timeout) return;
+
+		wather_off();
+
+		set_timeout(15);
+		AWAIT;
+		if (!timeout) return;
+
+on_state:
+		do {
+			AWAIT;
+			if (t <= t_max) return;
+			set_timeout(12);
+			AWAIT;
+			if (timeout) break;
+			if (t > t_max) return;
+		} while (true);
+
+		heat_off();
+
 	}
 
-end_at_tx:
-	if (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled) {
-		NRF_RADIO->EVENTS_DISABLED = 0;
-		NRF_RADIO->SHORTS = 0;
-		NRF_RADIO->TASKS_DISABLE = 1;
-		if (NRF_RADIO->STATE != RADIO_STATE_STATE_Disabled) {
-			goto end_during_disabling;
-		}
-	}
-	goto power_off;
-end_at_rx:
-	LOG_WRN("end at rx %d %d %d", ev, NRF_RADIO->STATE, NRF_RADIO->EVENTS_DISABLED);
-	NRF_RADIO->EVENTS_DISABLED = 0;
-	NRF_RADIO->SHORTS = 0;
-	NRF_RADIO->INTENCLR = RADIO_INTENSET_END_Msk;
-	NRF_RADIO->INTENSET = RADIO_INTENSET_DISABLED_Msk;
-	NRF_RADIO->TASKS_DISABLE = 1;
-end_during_disabling:
-	LOG_WRN("wait for disabled %d %d", NRF_RADIO->STATE, NRF_RADIO->EVENTS_DISABLED);
-	_resume_point = &&_resume_label_aaaa;
-	return true;
-	_resume_label_aaaa:
-	LOG_WRN("resume state %d %d", NRF_RADIO->STATE, NRF_RADIO->EVENTS_DISABLED);
-	if (!NRF_RADIO->EVENTS_DISABLED) return true;
-	NRF_RADIO->EVENTS_DISABLED = 0;
-power_off:
-	NRF_RADIO->POWER = 0;
-	LOG_WRN("powered off, ret false");
-	return false;
 }
 
-
-
-bool multiproto_radio_callback()
-{
-	return receive_async_func(RECV_EV_RADIO);
-}
-
-bool multiproto_start_callback()
-{
-	LOG_ERR("%d", (int)(k_uptime_get() / 1000LL));
-	return receive_async_func(RECV_EV_START);
-}
-
-bool multiproto_end_callback()
-{
-	return receive_async_func(RECV_EV_END);
-}
+#endif

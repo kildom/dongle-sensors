@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+#include "data.h"
+
 #ifdef CALENDAR_SHORT_TIMESTAMP
 typedef int32_t TimeStamp;
 #else
@@ -20,20 +22,6 @@ typedef struct {
 	bool leap;
 	uint8_t day_of_week;
 } DateTime;
-
-typedef struct {
-	int16_t time; // relative to base utc_offset
-	int8_t month;
-	int8_t day; // negative for fixed, positive or zero for floating
-	int8_t week; // negative counts backwards from end of month
-} DaylightTransition;
-
-typedef struct {
-	int16_t utc_offset;
-	int16_t daylight_delta; // Daylight disabled if zero
-	DaylightTransition daylight_start;
-	DaylightTransition daylight_end;
-} TimeZone;
 
 
 void convert_time_utc(TimeStamp time, DateTime* date);

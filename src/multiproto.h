@@ -3,11 +3,20 @@
 
 #include <stdbool.h>
 
+#define MULTIPROTO_REQ_END (-1)
+#define MULTIPROTO_REQ_CONTINUE (-2)
+#define MULTIPROTO_REQ_TIMER(us) (us)
+
+typedef enum {
+	MULTIPROTO_EV_START = 0,
+	MULTIPROTO_EV_END,
+	MULTIPROTO_EV_RADIO,
+	MULTIPROTO_EV_TIMER,
+	MULTIPROTO_COUNT_EV,
+} MultiProtoEvent;
+
 void multiproto_init();
 
-// callbacks
-bool multiproto_radio_callback();
-bool multiproto_start_callback();
-bool multiproto_end_callback();
+int multiproto_callback(MultiProtoEvent event);
 
 #endif

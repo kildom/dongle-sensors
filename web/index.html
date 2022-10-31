@@ -53,6 +53,7 @@
 					if (offset + writeBytes == data.length) {
 						temp[0] |= CHUNK_FLAG_END;
 					}
+					console.log(`Writing ${writeBytes} of ${data.length} to ${offset}`);
 					temp.set(data.subarray(offset, offset + writeBytes), 1);
 					blink();
 					await char.writeValueWithResponse(temp);
@@ -72,15 +73,77 @@
 					} else if (result.length == 0 && !(buf[0] & CHUNK_FLAG_BEGIN)) {
 						throw Error('Invalid response - expecting response begin');
 					}
+					console.log(`Read ${buf.length - 1} to ${result.length}`);
 					let t = new Uint8Array(result.length + buf.length - 1);
 					t.set(result);
 					t.set(buf.subarray(1), result.length);
 					result = t;
 				} while (!(buf[0] & CHUNK_FLAG_END));
 
-				log(result.length);
+				log(`Total read: ${result.length}`);
 
 				return result;
+			}
+
+			const CMD_GET_UP_TIME = 1;
+			const CMD_READ = 2;
+			const CMD_WRITE = 3;
+			const CMD_KEEP = 4;
+
+			const STATUS_OK = 0;
+			const STATUS_UNKNOWN_CMD = 1;
+			const STATUS_OUT_OF_BOUNDS = 2;
+
+			const MEMORY_CONFIG = 0;
+			const MEMORY_STATE = 1;
+
+			function createCommand(cmd, requestDataSize = 0, tag = 0)
+			{
+				let id = Math.floor(Math.random() * 65535);
+				let ab = new ArrayBuffer(4 + requestDataSize);
+				let header = new DataView(ab);
+				header.setUint8(0, cmd);
+				header.setUint8(1, tag);
+				header.setUint16(2, id, true);
+				return new DataView(ab, 4);
+			}
+
+			async function execCommand(data)
+			{
+				let ab = data.buffer;
+				let responseArray = await cmd(new Uint8Array(ab));
+				let requestHeader = new DataView(ab);
+				let responseHeader = new DataView(responseArray.buffer, responseArray.byteOffset, responseArray.byteLength);
+				if (responseHeader.getUint8(0) != requestHeader.getUint8(0)
+					|| responseHeader.getUint16(2, true) != requestHeader.getUint16(2, true)) {
+					throw Error('Command out of sync!');
+				}
+				if (responseHeader.getUint8(1) != STATUS_OK) {
+					throw Error(`Response status ${responseHeader.getUint8(1)}`);
+				}
+				return new DataView(responseArray.buffer, responseArray.byteOffset + 4, responseArray.byteLength - 4);
+			}
+
+			async function getUpTime() {
+				let c = createCommand(CMD_GET_UP_TIME);
+				let r = await execCommand(c);
+				return r.getUint32(0, true);
+			}
+
+			async function readMemory(memory, offset, size) {
+				let c = createCommand(CMD_READ, 4, memory);
+				c.setUint16(0, offset, true);
+				c.setUint16(2, size, true);
+				return await execCommand(c);
+			}
+
+			async function writeMemory(memory, offset, data) {
+				let length = data.byteLength;
+				let c = createCommand(CMD_WRITE, 2 + length, memory);
+				c.setUint16(0, offset, true);
+				let dst = new Uint8Array(c.buffer, c.byteOffset + 2, c.byteLength - 2);
+				dst.set(new Uint8Array(data.buffer, data.byteOffset, length));
+				await execCommand(c);
 			}
 
 			const serviceUuid = "cc2af14a-2aaf-4c6e-b2e4-3856ee2b4267";
@@ -98,12 +161,23 @@
 			let service = await device.gatt.getPrimaryService(serviceUuid);
 			log(service);
 			char = await service.getCharacteristic(charUuid);
-			let val = new Uint8Array(256);
+			/*let val = new Uint8Array(256);
 			val.fill(0x43);
 			await new Promise(resolve => setTimeout(resolve, 3000));
-			log(await cmd(val));
-			log(await device.gatt.disconnect());
+			log(await cmd(val));*/
+			log(await getUpTime());
+			log(await readMemory(MEMORY_STATE, 0, 4));
+			let time1 = Date.now();
+			let actual = await getUpTime();
+			let time2 = Date.now();
+			let expected = Math.floor((time1 + time2) / 2 / 1000);
+			let shift = expected - actual;
+			log(`actual ${actual}, expected ${expected}, shift ${shift}`);
+			let dataShift = new DataView(new ArrayBuffer(4));
+			dataShift.setUint32(0, shift, true);
+			await writeMemory(MEMORY_STATE, 0, dataShift);
 
+			await device.gatt.disconnect();
 			device.forget();
 
 		}
