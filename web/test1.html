@@ -1,0 +1,246 @@
+<html>
+
+<head>
+	<script src="main.js"></script>
+	<style>
+		body,
+		table {
+			font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+			font-size: 15px;
+		}
+
+		#nodesTable,
+		#channelsTable {
+			border-collapse: collapse;
+		}
+
+		#nodesTable td,
+		#channelsTable td {
+			border: 1px solid silver;
+			margin: 0px;
+			padding: 4px 6px;
+		}
+
+		.batCnt {
+			width: 95%;
+			background: #e0e0e0;
+			border: 1px solid #b3b1b1;
+			margin: 2px auto 0px;
+		}
+
+		.batLvl {
+			height: 7px;
+			background: #78a166;
+		}
+	</style>
+</head>
+
+<body>
+	<script>
+
+	</script>
+
+	<button style="font-size: 300%;" onclick="main(); return false;" id="output">Run Test</button>
+
+	<div id="nodesContainer">
+
+	</div>
+
+	<h1>Nodes</h1>
+
+	<table id="nodesTable" cellspacing="0">
+		<thead>
+			<tr>
+				<td></td>
+				<td>Name</td>
+				<td>Temp.</td>
+				<td>Battery</td>
+				<td>Address</td>
+				<td>Updated</td>
+				<td>Channel</td>
+				<td></td>
+			</tr>
+		</thead>
+		<tbody>
+			<tr>
+				<td>0</td>
+				<td>Nad schodami</td>
+				<td>23.5°C</td>
+				<td>40% (2.9V)<br>
+					<div class="batCnt">
+						<div class="batLvl" style="width: 40%;"></div>
+					</div>
+				</td>
+				<td>324F2E324F2E</td>
+				<td>3 min.</td>
+				<td>Średnia [0]</td>
+				<td><button>Edit</button></td>
+			</tr>
+			<tr>
+				<td>1</td>
+				<td>Salon</td>
+				<td>24°C</td>
+				<td>12% (2.82V)<br>
+					<div class="batCnt">
+						<div class="batLvl" style="width: 12%;"></div>
+					</div>
+				</td>
+				<td>234564234565</td>
+				<td>0 min.</td>
+				<td>Średnia [0]</td>
+				<td><button>Edit</button></td>
+			</tr>
+		</tbody>
+	</table>
+
+	<h1>Channels</h1>
+
+	<table id="channelsTable" cellspacing="0">
+		<thead>
+			<tr>
+				<td></td>
+				<td>Name</td>
+				<td>Temp.</td>
+				<td>Method</td>
+				<td></td>
+			</tr>
+		</thead>
+		<tbody>
+			<tr>
+				<td>0</td>
+				<td>Średnia</td>
+				<td>23.75°C</td>
+				<td>Average</td>
+				<td><button>Edit</button></td>
+			</tr>
+		</tbody>
+	</table>
+
+	<h1>Edit Node</h1>
+
+	<table id="editNode" cellspacing="0">
+		<tbody>
+			<tr>
+				<td>Name:</td>
+				<td><input type="text" value="Nad schodami" /></td>
+			</tr>
+			<tr>
+				<td>Channel:</td>
+				<td>
+					<select>
+						<option value="-">None</option>
+						<option value="0">Średnia [0]</option>
+						<option value="*">Create New</option>
+					</select>
+				</td>
+			</tr>
+			<tr>
+				<td colspan="2">
+					<button>Save</button>
+					<button>Cancel</button>
+					<button>Forget</button>
+				</td>
+			</tr>
+		</tbody>
+	</table>
+
+
+	<h1>Edit Channel</h1>
+
+	<table id="editChannel" cellspacing="0">
+		<tbody>
+			<tr>
+				<td>Name:</td>
+				<td><input type="text" value="Średnia" /></td>
+			</tr>
+			<tr>
+				<td>Method:</td>
+				<td>
+					<select>
+						<option value="avg">Average</option>
+						<option value="min">Minimum</option>
+						<option value="max">Maximum</option>
+					</select>
+				</td>
+			</tr>
+			<tr>
+				<td colspan="2">
+					<button>Save</button>
+					<button>Cancel</button>
+					<button>Delete</button>
+				</td>
+			</tr>
+		</tbody>
+	</table>
+
+	<h1>Edit Time Zone</h1>
+
+	<table id="editTimeZone" cellspacing="0">
+		<tbody>
+			<tr>
+				<td>Offset from UTC:</td>
+				<td><input type="text" value="+60" /></td>
+				<td>minutes</td>
+			</tr>
+			<tr>
+				<td>Daylight saving time offset:</td>
+				<td><input type="text" value="+60" /></td>
+				<td>minutes relative to base time of this timezone, or zero to disable</td>
+			</tr>
+			<tr>
+				<td colspan="3">Daylight start:</td>
+			</tr>
+			<tr>
+				<td>&nbsp;&nbsp;&nbsp;&nbsp;Time:</td>
+				<td><input type="text" value="120" /></td>
+				<td>minutes from 0:00 in base time of this timezone</td>
+			</tr>
+			<tr>
+				<td>&nbsp;&nbsp;&nbsp;&nbsp;Month:</td>
+				<td><input type="text" value="3" /></td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>&nbsp;&nbsp;&nbsp;&nbsp;Day:</td>
+				<td><input type="text" value="0" /></td>
+				<td>negative for fixed day of month, otherwise 0 for Sun., 1 for Mon., ...</td>
+			</tr>
+			<tr>
+				<td>&nbsp;&nbsp;&nbsp;&nbsp;Week:</td>
+				<td><input type="text" value="-1" /></td>
+				<td>negative counts from end of month</td>
+			</tr>
+			<tr>
+				<td colspan="3">Daylight end:</td>
+			</tr>
+			<tr>
+				<td>&nbsp;&nbsp;&nbsp;&nbsp;Time:</td>
+				<td><input type="text" value="120" /></td>
+				<td>minutes from 0:00 in base time of this timezone</td>
+			</tr>
+			<tr>
+				<td>&nbsp;&nbsp;&nbsp;&nbsp;Month:</td>
+				<td><input type="text" value="10" /></td>
+				<td></td>
+			</tr>
+			<tr>
+				<td>&nbsp;&nbsp;&nbsp;&nbsp;Day:</td>
+				<td><input type="text" value="0" /></td>
+				<td>negative for fixed day of month, otherwise 0 for Sun., 1 for Mon., ...</td>
+			</tr>
+			<tr>
+				<td>&nbsp;&nbsp;&nbsp;&nbsp;Week:</td>
+				<td><input type="text" value="-1" /></td>
+				<td>negative counts from end of month</td>
+			</tr>
+			<tr>
+				<td colspan="2">
+					<button>Save</button>
+					<button>Cancel</button>
+				</td>
+			</tr>
+		</tbody>
+	</table>
+</body>
+
+</html>

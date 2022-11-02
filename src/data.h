@@ -64,5 +64,10 @@ typedef struct {
 	StateChannel channels[8];
 } State;
 
+extern Config data_config;
+extern State data_state;
+
+void data_config_keep();
+void data_init();
 
 #endif // _data_h_

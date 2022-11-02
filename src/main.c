@@ -23,163 +23,208 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(temp_main);
 
-#define CMD_GET_UP_TIME 1
-#define CMD_READ 2
-#define CMD_WRITE 3
-#define CMD_KEEP 4
+#define NO_CHANNEL  0xFF
+#define TEMPERATURE_NO_VALUE 0x7FFF
+#define VOLTAGE_NO_VALUE 0x7FFF
 
-#define STATUS_OK 0
-#define STATUS_UNKNOWN_CMD 1
-#define STATUS_OUT_OF_BOUNDS 2
-
-
-Config config;
-State state;
-
-
-static struct k_work on_packet_work;
-
-
-void ble_packet() {
-	k_work_submit(&on_packet_work);
-}
-
-#define PACKET_HEADER_SIZE 4
-
-typedef struct {
-	uint8_t cmd;
-	uint8_t tag;
-	uint16_t id;
-	union
-	{
-		struct {
-			uint16_t offset;
-			uint16_t size;
-		} read;
-		struct {
-			uint16_t offset;
-			uint8_t buffer[0];
-		} write;
-	};
-} Request;
-
-typedef struct {
-	uint8_t cmd;
-	uint8_t status;
-	uint16_t id;
-	union
-	{
-		struct {
-			uint32_t time;
-		} get_up_time;
-		struct {
-			uint8_t buffer[0];
-		} read;
-	};
-} Response;
-
-
-static void on_packet_work_handler(struct k_work *work)
-{
-	const Request* req = (const Request*)&ble_request[0];
-	Response* res = (Response*)&ble_response[0];
-	void* response_end = &ble_response[PACKET_HEADER_SIZE];
-	res->cmd = req->cmd;
-	res->status = STATUS_OK;
-	res->id = req->id;
-	switch (req->cmd)
-	{
-	case CMD_GET_UP_TIME:
-		res->get_up_time.time = k_uptime_get() / (int64_t)1000;
-		response_end = &res->get_up_time.time + 1;
-		break;
-	case CMD_READ: {
-		printk("READ %d from %d\n", req->read.size, req->read.offset);
-		uint8_t* src = req->tag == 0 ? (uint8_t*)&config : (uint8_t*)&state;
-		size_t src_size = req->tag == 0 ? sizeof(config) : sizeof(state);
-		if ((size_t)req->read.size > sizeof(ble_response) - PACKET_HEADER_SIZE
-			|| (size_t)req->read.offset + (size_t)req->read.size > src_size
-			|| req->tag > 1) {
-			res->status = STATUS_OUT_OF_BOUNDS;
-			break;
-		}
-		memcpy(res->read.buffer, src + (size_t)req->read.offset, req->read.size);
-		response_end = &res->read.buffer[req->read.size];
-		break;
-	}
-	case CMD_WRITE: {
-		uint8_t* dst = req->tag == 0 ? (uint8_t*)&config : (uint8_t*)&state;
-		size_t dst_size = req->tag == 0 ? sizeof(config) : sizeof(state);
-		size_t write_size = ble_request_size - offsetof(Request, write.buffer);
-		printk("WRITE %d to %d\n", write_size, req->write.offset);
-		if (write_size + (size_t)req->write.offset > sizeof(dst_size) || req->tag > 1) {
-			res->status = STATUS_OUT_OF_BOUNDS;
-			break;
-		}
-		memcpy(dst + (size_t)req->write.offset, req->write.buffer, write_size);
-		break;
-	}
-	case CMD_KEEP:
-		printk("TODO: save config!\n");
-		break;
-	default:
-		res->status = STATUS_UNKNOWN_CMD;
-		break;
-	}
-
-	ble_response_size = (uint8_t*)response_end - &ble_response[0]; // TODO: atomic response_size
-	printk("Response size %d\n", ble_response_size);
-}
-
-static int t = 0;
-static int v = 0;
-static volatile bool is_new = false;
-
-void packet_received(OutputPacket* packet)
-{
-	t = packet->temp;
-	v = packet->voltage;
-	is_new = true;
-}
 
 static const char* day_names[7] = {
 	"Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat",
 };
 
+
+static void packets_queue_handler(struct k_work *work);
+
+
+K_MSGQ_DEFINE(packets_queue, sizeof(OutputPacket), 8, 4);
+K_WORK_DEFINE(packets_queue_work, packets_queue_handler);
+
+
+void packet_received(OutputPacket* packet)
+{
+	int err = k_msgq_put(&packets_queue, packet, K_NO_WAIT);
+	if (err != 0) {
+		LOG_WRN("Packet dropped - queue overrun!");
+	} else {
+		k_work_submit(&packets_queue_work);
+	}
+}
+
+int get_up_time() {
+	return (int)(k_uptime_get() / 1000LL);
+}
+
+static int16_t min_of_channel(int channel_index) {
+	int16_t result = 0x7FFF;
+	for (int i = 0; i < data_config.node_count; i++) {
+		ConfigNode* config_node = &data_config.nodes[i];
+		StateNode* state_node = &data_state.nodes[i];
+		if (config_node->channel != channel_index) {
+			continue;
+		}
+		if (state_node->temperature == TEMPERATURE_NO_VALUE) {
+			return TEMPERATURE_NO_VALUE;
+		}
+		if (state_node->temperature < result) {
+			result = state_node->temperature;
+		}
+	}
+	if (result == 0x7FFF) {
+		return TEMPERATURE_NO_VALUE;
+	}
+	return result;
+}
+
+static int16_t max_of_channel(int channel_index) {
+	int16_t result = -0x7FFF;
+	for (int i = 0; i < data_config.node_count; i++) {
+		ConfigNode* config_node = &data_config.nodes[i];
+		StateNode* state_node = &data_state.nodes[i];
+		if (config_node->channel != channel_index) {
+			continue;
+		}
+		if (state_node->temperature == TEMPERATURE_NO_VALUE) {
+			return TEMPERATURE_NO_VALUE;
+		}
+		if (state_node->temperature > result) {
+			result = state_node->temperature;
+		}
+	}
+	if (result == -0x7FFF) {
+		return TEMPERATURE_NO_VALUE;
+	}
+	return result;
+}
+
+static int16_t avg_of_channel(int channel_index) {
+	int32_t result = 0;
+	int32_t count = 0;
+	for (int i = 0; i < data_config.node_count; i++) {
+		ConfigNode* config_node = &data_config.nodes[i];
+		StateNode* state_node = &data_state.nodes[i];
+		if (config_node->channel != channel_index) {
+			continue;
+		}
+		if (state_node->temperature == TEMPERATURE_NO_VALUE) {
+			return TEMPERATURE_NO_VALUE;
+		}
+		result += state_node->temperature;
+		count++;
+	}
+	if (count == 0) {
+		return TEMPERATURE_NO_VALUE;
+	}
+	return (result + (count / 2)) / count;
+}
+
+static void packet_received_on_work(OutputPacket* packet)
+{
+	if (data_state.time_shift == 0) {
+		int sec = (int)(k_uptime_get() / 1000LL);
+		int min = sec / 60; sec %= 60;
+		int hour = min / 60; min %= 60;
+		int day = hour / 24; hour %= 24;
+		printk("%d %02d:%02d:%02d %d\n", day, hour, min, sec, data_state.time_shift);
+	} else {
+		static DateTime dt;
+		uint64_t time = k_uptime_get() / 1000LL + (uint64_t)data_state.time_shift;
+		convert_time_tz(time, &dt, &data_config.time_zone);
+		printk("%d-%02d-%02d %s %02d:%02d:%02d\n", dt.year, dt.month, dt.day, day_names[dt.day_of_week],
+			dt.hour, dt.min, dt.sec);
+	}
+	int t = packet->temp;
+	int v = packet->voltage;
+	printk("Node: %04X%08X\n", packet->address_high, packet->address_low);
+	printk("Temperature: %d.%d%d*C\n", t / 100, (t / 10) % 10, t % 10);
+	printk("Voltage: %d.%d%dV\n", v / 100, (v / 10) % 10, v % 10);
+
+	ConfigNode* config_node = NULL;
+	StateNode* state_node = NULL;
+	int node_index = -1;
+
+	for (int i = 0; i < data_config.node_count; i++)
+	{
+		ConfigNode* n = &data_config.nodes[i];
+		if (n->addr_high == packet->address_high && n->addr_low == packet->address_low) {
+			node_index = i;
+			config_node = n;
+			state_node = &data_state.nodes[i];
+			break;
+		}
+	}
+
+	if (config_node == NULL) {
+		if (data_config.node_count < ARRAY_SIZE(data_config.nodes)) {
+			node_index = data_config.node_count;
+			config_node = &data_config.nodes[node_index];
+			state_node = &data_state.nodes[node_index];
+			config_node->addr_high = packet->address_high;
+			config_node->addr_low = packet->address_low;
+			config_node->channel = NO_CHANNEL;
+			strcpy(config_node->name, "[no name]");
+			state_node->last_update = 0;
+			state_node->temperature = TEMPERATURE_NO_VALUE;
+			state_node->voltage = VOLTAGE_NO_VALUE;
+			printk("New node added %04X%08X at %d\n", config_node->addr_high, config_node->addr_low, node_index);
+			data_config.node_count++;
+		} else {
+			LOG_ERR("Too many nodes!");
+			printk("Too many nodes!\n");
+			return;
+		}
+	}
+
+	printk("Node %d %s\n", node_index, config_node->name);
+
+	state_node->last_update = get_up_time();
+	state_node->temperature = packet->temp;
+	state_node->voltage = packet->voltage;
+
+	if (config_node->channel < ARRAY_SIZE(data_config.channels)) {
+		ConfigChannel *config_channel = &data_config.channels[config_node->channel];
+		StateChannel *state_channel = &data_state.channels[config_node->channel];
+		switch (config_channel->func)
+		{
+		case FUNC_MIN:
+			state_channel->temperature = min_of_channel(config_node->channel);
+			break;
+		case FUNC_MAX:
+			state_channel->temperature = max_of_channel(config_node->channel);
+			break;
+		case FUNC_AVG:
+			state_channel->temperature = avg_of_channel(config_node->channel);
+			break;
+		default:
+			break;
+		}
+		printk("Channel %d %s temperature: %d.%d%d*C\n", config_node->channel, config_channel->name, t / 100, (t / 10) % 10, t % 10);
+	}
+
+}
+
+static void packets_queue_handler(struct k_work *work)
+{
+	int err;
+	OutputPacket packet;
+	do {
+		err = k_msgq_get(&packets_queue, &packet, K_NO_WAIT);
+		if (err == 0) {
+			packet_received_on_work(&packet);
+		}
+	} while (err == 0);
+}
+
 void main(void)
 {
-	static DateTime dt;
-
 	printk("START\n");
 
-	leds_init();
+	data_init();
 
-	k_work_init(&on_packet_work, on_packet_work_handler);
+	leds_init();
 
 	ble_init();
 
 	multiproto_init();
-
-	while (1) {
-		k_msleep(1000);
-		if (state.time_shift == 0) {
-			int sec = (int)(k_uptime_get() / 1000LL);
-			int min = sec / 60; sec %= 60;
-			int hour = min / 60; min %= 60;
-			int day = hour / 24; hour %= 24;
-			printk("%d %02d:%02d:%02d %d\n", day, hour, min, sec, state.time_shift);
-		} else {
-			uint64_t time = k_uptime_get() / 1000LL + (uint64_t)state.time_shift;
-			convert_time_tz(time, &dt, &config.time_zone);
-			printk("%d-%02d-%02d %s %02d:%02d:%02d\n", dt.year, dt.month, dt.day, day_names[dt.day_of_week],
-				dt.hour, dt.min, dt.sec);
-		}
-		if (is_new) {
-			is_new = false;
-			printk("Temperature: %d.%d%d*C\n", t / 100, (t / 10) % 10, t % 10);
-			printk("Voltage: %d.%d%dV\n", v / 100, (v / 10) % 10, v % 10);
-		}
-	}
 }
 
 

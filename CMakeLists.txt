@@ -16,4 +16,4 @@ add_custom_command(
   DEPENDS ${CMAKE_CURRENT_LIST_DIR}/src/data.h
   VERBATIM)
 
-target_sources(app PRIVATE src/main.c src/multiproto.c src/calendar.c src/radio.c src/ble.c src/hash.h)
+target_sources(app PRIVATE src/main.c src/multiproto.c src/calendar.c src/radio.c src/ble.c src/blecmd.c src/data.c src/hash.h)

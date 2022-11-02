@@ -173,7 +173,7 @@ static bool is_daylight_enabled(const DateTime* date, int time_of_day, const Tim
 			return false;
 		} else if (day > tr_day) {
 			return true;
-		} else if (time_of_day < (int)tz->daylight_start.time + delta) {
+		} else if (time_of_day < (int)tz->daylight_start.time * SECONDS_PER_MINUTE + delta) {
 			return false;
 		} else {
 			return true;
@@ -184,7 +184,7 @@ static bool is_daylight_enabled(const DateTime* date, int time_of_day, const Tim
 			return true;
 		} else if (day > tr_day) {
 			return false;
-		} else if (time_of_day < (int)tz->daylight_end.time + delta) {
+		} else if (time_of_day < (int)tz->daylight_end.time * SECONDS_PER_MINUTE + delta) {
 			return true;
 		} else {
 			return false;
@@ -212,11 +212,11 @@ TimeStamp make_time_utc(const DateTime* date)
 }
 
 void convert_time_tz(TimeStamp time, DateTime* date, const TimeZone* tz) {
-	TimeStamp tz_time = time + tz->utc_offset;
+	TimeStamp tz_time = time + (TimeStamp)tz->utc_offset * SECONDS_PER_MINUTE;
 	convert_time_utc(tz_time, date);
 	int time_of_day = (int)date->sec + 60 * ((int)date->min + 60 * (int)date->hour);
 	if (is_daylight_enabled(date, time_of_day, tz, 0)) {
-		convert_time_utc(tz_time + tz->daylight_delta, date);
+		convert_time_utc(tz_time + (TimeStamp)tz->daylight_delta * SECONDS_PER_MINUTE, date);
 	}
 }
 
@@ -225,10 +225,10 @@ TimeStamp make_time_tz(const DateTime* date, const TimeZone* tz)
 	DateTime temp_date;
 	int time_of_day;
 	int days_from_0 = normalize_date(date, &time_of_day);
-	TimeStamp result = (TimeStamp)(days_from_0 - DAYS_BEFORE_1970) * (TimeStamp)SECONDS_PER_DAY + (TimeStamp)time_of_day - (TimeStamp)tz->utc_offset;
+	TimeStamp result = (TimeStamp)(days_from_0 - DAYS_BEFORE_1970) * (TimeStamp)SECONDS_PER_DAY + (TimeStamp)time_of_day - (TimeStamp)tz->utc_offset * (TimeStamp)SECONDS_PER_MINUTE;
 	days_from_0_to_date(days_from_0, &temp_date);
-	if (is_daylight_enabled(&temp_date, time_of_day, tz, tz->daylight_delta)) {
-		result -= (TimeStamp)tz->daylight_delta;
+	if (is_daylight_enabled(&temp_date, time_of_day, tz, (TimeStamp)tz->daylight_delta * SECONDS_PER_MINUTE)) {
+		result -= (TimeStamp)tz->daylight_delta * SECONDS_PER_MINUTE;
 	}
 	return result;
 }

@@ -22,6 +22,9 @@
 #include <zephyr/logging/log.h>
 LOG_MODULE_REGISTER(temp_ble);
 
+#define REQUEST_SIZE 512
+#define RESPONSE_SIZE 512
+
 #define CHUNK_SIZE 16
 #define CHUNK_FLAG_BEGIN 0x40
 #define CHUNK_FLAG_END 0x80
@@ -39,14 +42,14 @@ static const struct bt_data ad[] = {
 };
 
 
-uint8_t ble_request[REQUEST_SIZE];
-int ble_request_size = 0;
+static uint8_t ble_request[REQUEST_SIZE];
+static volatile int ble_request_size = 0;
 static uint8_t request_id = 255;
 static int request_offset = 0;
 
 
-uint8_t ble_response[RESPONSE_SIZE];
-int ble_response_size = 0;
+static uint8_t ble_response[RESPONSE_SIZE];
+static volatile int ble_response_size = 0;
 static uint8_t response_id = 255;
 static int response_offset = 0;
 
@@ -54,6 +57,7 @@ static int response_offset = 0;
 static ssize_t read_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 			void *buf, uint16_t len, uint16_t offset)
 {
+	int response_size_copy;
 	uint8_t temp[1 + CHUNK_SIZE];
 	LOG_DBG("GATT read %d bytes at %d", len, offset);
 
@@ -64,14 +68,18 @@ static ssize_t read_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 
 	temp[0] = response_id;
 
-	if (ble_response_size == 0) {
+	__DMB();
+	response_size_copy = ble_response_size;
+	__DMB();
+
+	if (response_size_copy == 0) {
 		return bt_gatt_attr_read(conn, attr, buf, len, offset, temp, 0);
-	} else if (response_offset >= ble_response_size) {
+	} else if (response_offset >= response_size_copy) {
 		temp[0] |= CHUNK_FLAG_END;
 		return bt_gatt_attr_read(conn, attr, buf, len, offset, temp, 1);
 	}
 
-	int send_size = ble_response_size - response_offset;
+	int send_size = response_size_copy - response_offset;
 	if (send_size > CHUNK_SIZE) {
 		send_size = CHUNK_SIZE;
 	}
@@ -81,7 +89,7 @@ static ssize_t read_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 	}
 	memcpy(&temp[1], &ble_response[response_offset], send_size);
 	response_offset += send_size;
-	if (response_offset == ble_response_size) {
+	if (response_offset == response_size_copy) {
 		temp[0] |= CHUNK_FLAG_END;
 	}
 
@@ -109,7 +117,9 @@ static ssize_t write_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 	} else if (input_flags & CHUNK_FLAG_BEGIN) {
 		request_id = input_flags & CHUNK_ID_MASK;
 		request_offset = 0;
+		__DMB();
 		ble_request_size = 0;
+		__DMB();
 	} else if ((input_flags & CHUNK_ID_MASK) != request_id) {
 		err = BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 		goto error;
@@ -122,11 +132,13 @@ static ssize_t write_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 
 	memcpy(&ble_request[request_offset], input, input_len);
 	request_offset += input_len;
-	ble_request_size = request_offset;
 
 	if (input_flags & CHUNK_FLAG_END) {
-		response_id = request_id;
+		__DMB();
+		ble_request_size = request_offset;
 		ble_response_size = 0;
+		__DMB();
+		response_id = request_id;
 		response_offset = 0;
 		request_id = 255;
 		request_offset = 0;
@@ -138,7 +150,9 @@ static ssize_t write_vnd(struct bt_conn *conn, const struct bt_gatt_attr *attr,
 error:
 	request_id = 255;
 	request_offset = 0;
+	__DMB();
 	ble_request_size = 0;
+	__DMB();
 	return err;
 }
 
@@ -166,5 +180,38 @@ void ble_init()
 	if (ret) {
 		printk("Advertising failed to start (err %d)\n", ret);
 		k_oops();
+	}
+}
+
+uint8_t *ble_response_prepare(size_t* max_size)
+{
+	__DMB();
+	ble_response_size = 0;
+	__DMB();
+	*max_size = sizeof(ble_response);
+	return ble_response;
+}
+
+void ble_response_send(size_t size)
+{
+	__DMB();
+	ble_response_size = size;
+	__DMB();
+}
+
+const uint8_t *ble_request_get(size_t* size)
+{
+	int request_size_copy;
+	__DMB();
+	request_size_copy = ble_request_size;
+	ble_request_size = 0;
+	request_id = 255;
+	request_offset = 0;
+	__DMB();
+	*size = request_size_copy;
+	if (request_size_copy == 0) {
+		return NULL;
+	} else {
+		return ble_request;
 	}
 }
